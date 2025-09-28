@@ -1,13 +1,12 @@
-name: Crawl 3bong and upload to Google Sheets
+name: crawler
 
 on:
   schedule:
-    # 매일 09:00 한국시간 = 00:00 UTC
-    - cron: "0 0 * * *"
-  workflow_dispatch: {}  # 수동 실행 버튼
+    - cron: '0 0 * * *'   # UTC 00:00 → 한국 09:00
+  workflow_dispatch: {}    # 수동 실행 버튼
 
 jobs:
-  run-crawler:
+  run:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Seoul
@@ -19,21 +18,25 @@ jobs:
       LOGIN_URL: ${{ secrets.LOGIN_URL }}
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
+      # 옵션들(있으면 사용, 없으면 코드 기본값 사용)
+      ENABLE_STOCK: ${{ secrets.ENABLE_STOCK }}
+      STOCK_MODE: ${{ secrets.STOCK_MODE }}
+      STOCK_CONCURRENCY: ${{ secrets.STOCK_CONCURRENCY }}
+      STOCK_TIMEOUT_MS: ${{ secrets.STOCK_TIMEOUT_MS }}
+      TREAT_SILENT_AS_ZERO: ${{ secrets.TREAT_SILENT_AS_ZERO }}
+      MAX_PAGES: ${{ secrets.MAX_PAGES }}
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -m playwright install chromium
-          python -m playwright install-deps
 
       - name: Run crawler
         run: python -u crawler.py
