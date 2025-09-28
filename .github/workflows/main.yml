@@ -36,4 +36,4 @@ jobs:
           python -m playwright install-deps
 
       - name: Run crawler
-        run: python crawler.py
+        run: python -u crawler.py
