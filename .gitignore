@@ -1,0 +1,5 @@
+.venv/
+.env
+*.json
+__pycache__/
+3bong_products.csv
