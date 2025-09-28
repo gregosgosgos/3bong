@@ -1,11 +1,9 @@
 # crawler.py
 import os, re, json, asyncio
 import pandas as pd
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
-
-# === Google Sheets ===
+from playwright.async_api import async_playwright, TimeoutError as PwTimeoutError
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -20,10 +18,19 @@ USER_PW   = os.getenv("USER_PW")
 SHEET_ID  = os.getenv("SHEET_ID")
 SHEET_TAB = os.getenv("SHEET_TAB", "크롤링결과")
 
-if not USER_ID or not USER_PW:
-    raise RuntimeError(".env에 USER_ID, USER_PW를 채워주세요.")
-if not SHEET_ID:
-    raise RuntimeError(".env에 SHEET_ID를 넣어주세요. (해당 시트를 서비스계정 이메일로 편집자 공유 필수)")
+# 성능/재고 관련 옵션(.env)
+ENABLE_STOCK = os.getenv("ENABLE_STOCK", "1") == "1"       # 0이면 재고 수집 스킵
+STOCK_MODE = os.getenv("STOCK_MODE", "http")               # "http" (빠름) 또는 "dialog" (정확도↑)
+STOCK_CONCURRENCY = int(os.getenv("STOCK_CONCURRENCY", "20"))  # 동시 요청 수(HTTP 모드)
+STOCK_TIMEOUT_MS  = int(os.getenv("STOCK_TIMEOUT_MS", "2000"))  # 각 HTTP 요청 타임아웃(ms)
+TREAT_SILENT_AS_ZERO = os.getenv("TREAT_SILENT_AS_ZERO", "1") == "1"  # dialog 모드에서 무반응+10000 유지시 0 기록
+MAX_PAGES = int(os.getenv("MAX_PAGES", "0") or "0")        # 테스트용 페이지 제한(0=무제한)
+
+required_keys = ["USER_ID", "USER_PW", "SHEET_ID"]
+missing = [k for k in required_keys if not os.getenv(k)]
+if missing:
+    raise RuntimeError(f"환경변수 누락: {', '.join(missing)}. "
+                       "로컬은 .env, GitHub Actions는 Secrets로 설정하세요.")
 
 # ======================
 # 카테고리
@@ -58,10 +65,9 @@ def clean_price_text(txt: str | None) -> int | None:
 
 def strip_brand_prefix(name: str) -> str:
     """
-    문자열 맨 앞 '브랜드명)' 접두어가 있으면 제거.
+    맨 앞 '브랜드명)' 패턴만 제거 (중간 괄호는 유지)
     예) '오성) 레몬맛 샌드 227g' -> '레몬맛 샌드 227g'
         '삼진)바삭프레첼버터갈릭맛 45g' -> '바삭프레첼버터갈릭맛 45g'
-    (중간 괄호는 건드리지 않음)
     """
     if not name: return name
     m = re.match(r'^\s*([^\(\)\[\]]{1,30})\)\s*(.+)$', name)
@@ -75,11 +81,10 @@ def parse_name_pack_expiry(raw_name: str | None):
         return None, None, None, None
     lines = [re.sub(r"\s+", " ", l.strip()) for l in raw_name.splitlines() if l.strip()]
     base_name = lines[0] if lines else raw_name.strip()
-    base_name = strip_brand_prefix(base_name)  # 제조사 접두어 제거
+    base_name = strip_brand_prefix(base_name)
     tail_text = " ".join(lines[1:]) if len(lines) > 1 else ""
 
     unit = None; qty = None; expiry = None
-    # ( ... ) 블록에서 타/박/개 + n개입
     for m in re.finditer(r"\(([^)]*)\)", tail_text):
         inside = m.group(1)
         mu = re.search(r"(타|박|개)", inside)
@@ -90,7 +95,6 @@ def parse_name_pack_expiry(raw_name: str | None):
             except: qty = None
         if unit or (qty is not None):
             break
-    # YY.MM.DD
     md = re.search(r"(\d{2}\.\d{2}\.\d{2})", tail_text)
     if md: expiry = md.group(1)
     return base_name, unit, qty, expiry
@@ -101,7 +105,8 @@ def build_list_url(cate_code: str, page: int) -> str:
     qs = {"cateCd": cate_code, "page": str(page)}
     return urlunparse(parsed._replace(query=urlencode(qs)))
 
-def absolutize(url: str | None) -> str | None:
+def absolutize_img(url: str | None) -> str | None:
+    # 이미지 쪽은 기존 로직 유지(이미 정상 동작)
     if not url: return None
     if url.startswith("http"): return url
     if url.startswith("//"):   return "https:" + url
@@ -146,7 +151,7 @@ async def login(page):
     await page.wait_for_load_state("networkidle")
 
 # ======================
-# 페이지 수 추정(가볍게)
+# 페이지 수 추정
 # ======================
 async def get_max_page_on(page) -> int:
     last = await page.query_selector('a[aria-label="Last"], a.last, a[href*="page="]:has-text("끝")')
@@ -169,7 +174,7 @@ async def get_max_page_on(page) -> int:
     return mx
 
 # ======================
-# 품절 판정(가볍게)
+# 품절 제외
 # ======================
 async def is_soldout(card) -> bool:
     try:
@@ -181,7 +186,7 @@ async def is_soldout(card) -> bool:
     return False
 
 # ======================
-# 썸네일 추출
+# 썸네일
 # ======================
 async def extract_thumbnail(card) -> str | None:
     box = await card.query_selector(PHOTO_BOX_SEL)
@@ -190,92 +195,59 @@ async def extract_thumbnail(card) -> str | None:
         if img:
             for attr in ("data-original", "src"):
                 v = await img.get_attribute(attr)
-                if v: return absolutize(v)
+                if v: return absolutize_img(v)
         return None
     for attr in ("data-image-list", "data-image-main", "data-image-detail"):
         v = await box.get_attribute(attr)
-        if v: return absolutize(v)
+        if v: return absolutize_img(v)
     img = await box.query_selector("img[data-original], img[src]")
     if img:
         for attr in ("data-original", "src"):
             v = await img.get_attribute(attr)
-            if v: return absolutize(v)
+            if v: return absolutize_img(v)
     return None
 
 # ======================
-# 판매가/판매수량 선택
-# - 10~20% 범위 내 '마진율 최대' 우선
-# - 없으면 20% 초과 중 '20%에 가장 가까운(초과 최소)' 선택
-# - 그래도 없으면 공란
+# 판매가/판매수량 선택 (마진 10~20%)
 # ======================
 SALE_CANDIDATES = [1900, 2900, 3900]
 FEE_RATE = 0.22
-BAND_MIN = 0.10   # 하한 10%
+BAND_MIN = 0.10
 BAND_MAX = 0.20
 
 def choose_sale_combo(unit_cost: float | None):
-    """
-    unit_cost: 개당단가
-    반환: (판매가, 판매수량, 마진율) 혹은 (None, None, None)
-    """
     if unit_cost is None or unit_cost <= 0:
         return None, None, None
-
     feasible = []
     for sp in SALE_CANDIDATES:
         net = sp * (1 - FEE_RATE)
-        if net <= 0:
-            continue
-        # margin >= 0.10 만족하는 최대 수량
+        if net <= 0: continue
         q_max = int((1 - BAND_MIN) * net // unit_cost)  # floor(0.9*net/unit_cost)
         if q_max >= 1:
             margin = 1 - (q_max * unit_cost) / net
             feasible.append((sp, q_max, margin))
-
     if not feasible:
         return None, None, None
-
     in_band = [r for r in feasible if BAND_MIN <= r[2] <= BAND_MAX]
     if in_band:
-        in_band.sort(key=lambda x: (-x[2], x[0]))  # 마진 내림차순, 동률이면 낮은 판매가
-        sp, q, m = in_band[0]
-        return sp, q, m
-
+        in_band.sort(key=lambda x: (-x[2], x[0]))    # 마진 내림차순, 동률이면 낮은 판매가
+        return in_band[0]
     above = [r for r in feasible if r[2] > BAND_MAX]
     if above:
         above.sort(key=lambda x: (x[2] - BAND_MAX, x[0]))  # 초과폭 최소, 동률이면 낮은 판매가
-        sp, q, m = above[0]
-        return sp, q, m
-
-    return None, None, None  # 모두 10% 미만이면 공란
+        return above[0]
+    return None, None, None
 
 # ======================
-# 상세페이지에서 재고수량(data-stock) 추출
+# 카드 → 기초 행 (재고 제외)
 # ======================
-async def fetch_stock_from_detail(page, goods_url: str) -> int | None:
-    """
-    상품 상세 페이지 HTML 내 input[name='goodsCnt[]']의 data-stock에서 재고수량 추출
-    옵션 인풋이 여러 개면 최댓값을 사용 (정책 변경 가능)
-    """
-    resp = await page.request.get(goods_url)
-    html = await resp.text()
-    stocks = [int(s.replace(",", "")) for s in re.findall(r'data-stock="([\d,]+)"', html)]
-    if stocks:
-        return max(stocks)   # 합계로 바꾸려면 sum(stocks)
-    return None
-
-# ======================
-# 카드 → 행
-# ======================
-async def parse_card_to_row(page, card, cate_name: str, current_url: str):
+async def parse_card_to_row_base(page, card, cate_name: str, current_url: str):
     if await is_soldout(card):
         return None
 
-    # 이름/묶음/유통기한
     raw_name = await text_of(await card.query_selector(NAME_SEL))
     prod_name, pack_unit, pack_qty, expiry = parse_name_pack_expiry(raw_name)
 
-    # 묶음단가(총액)
     bundle_price = None
     holder = await card.query_selector("[data-goods-price]")
     if holder:
@@ -287,13 +259,13 @@ async def parse_card_to_row(page, card, cate_name: str, current_url: str):
         txt = await text_of(await card.query_selector(PRICE_FALLBACK))
         bundle_price = clean_price_text(txt)
 
-    # 상세 링크/코드
+    # 상세 링크(상세만 urljoin으로 정확히)
     full = None; code = None
     link = await card.query_selector(DETAIL_LINKSEL)
     if link:
         href = await link.get_attribute("href")
         if href:
-            full = absolutize(href)
+            full = urljoin(current_url, href)   # ✅ 핵심: goods/goods/goods_view.php 방지
             qs = parse_qs(urlparse(full).query)
             code = qs.get("goodsNo", [None])[0]
     if not code:
@@ -301,26 +273,17 @@ async def parse_card_to_row(page, card, cate_name: str, current_url: str):
         if holder2:
             code = await holder2.get_attribute("data-goods-no")
 
-    # 이미지
     thumb = await extract_thumbnail(card)
 
-    # 개당단가
     unit_cost = None
     if bundle_price is not None and pack_qty:
         unit_cost = round(bundle_price / pack_qty)
 
-    # 판매가/판매수량/마진율
     sell_price, sell_qty, margin = choose_sale_combo(unit_cost)
-
-    # 재고수량 (상세페이지 data-stock)
-    stock_qty = None
-    if full:
-        stock_qty = await fetch_stock_from_detail(page, full)
 
     if not prod_name:
         return None
 
-    # === 최종 행 (컬럼 순서 반영: 개당단가 → 재고수량 → 판매수량) ===
     return {
         "카테고리": cate_name,
         "상품명": prod_name,
@@ -328,7 +291,7 @@ async def parse_card_to_row(page, card, cate_name: str, current_url: str):
         "묶음당수량": pack_qty,
         "묶음단가": bundle_price,
         "개당단가": unit_cost,
-        "재고수량": stock_qty,              # ← 여기
+        "재고수량": None,          # <- 이후 보강
         "판매수량": sell_qty,
         "판매가": sell_price,
         "마진율": round(margin, 4) if margin is not None else None,
@@ -337,7 +300,7 @@ async def parse_card_to_row(page, card, cate_name: str, current_url: str):
     }
 
 # ======================
-# 크롤링 루틴
+# 카테고리 크롤
 # ======================
 async def crawl_category(page, cate_name: str, cate_code: str):
     rows = []
@@ -345,6 +308,8 @@ async def crawl_category(page, cate_name: str, cate_code: str):
     await page.goto(first, wait_until="domcontentloaded")
     max_page = await get_max_page_on(page)
     if max_page < 1: max_page = 1
+    if MAX_PAGES and max_page > MAX_PAGES:
+        max_page = MAX_PAGES
     print(f"[{cate_name}] 최대 {max_page}페이지 추정")
 
     for p in range(1, max_page + 1):
@@ -352,17 +317,192 @@ async def crawl_category(page, cate_name: str, cate_code: str):
         await page.goto(url, wait_until="domcontentloaded")
         cards = await page.query_selector_all(CARD_SEL)
         print(f"[{cate_name}] {p}페이지 카드수: {len(cards)}")
-
         if not cards:
             break
         for c in cards:
-            row = await parse_card_to_row(page, c, cate_name, url)
+            row = await parse_card_to_row_base(page, c, cate_name, url)
             if row: rows.append(row)
-        await page.wait_for_timeout(20)
     return rows
 
 # ======================
-# Sheets 업로드
+# 재고수량 (HTTP 모드: 빠름)
+# ======================
+async def fetch_stock_http(request_ctx, url: str) -> int | None:
+    # 짧은 타임아웃 + 1회 재시도
+    async def _once():
+        try:
+            resp = await request_ctx.get(url, timeout=STOCK_TIMEOUT_MS)
+            if not resp.ok:
+                return None
+            html = await resp.text()
+            stocks = [int(s.replace(",", "")) for s in re.findall(r'data-stock\s*=\s*["\']?([\d,]+)', html)]
+            return max(stocks) if stocks else None
+        except:
+            return None
+    v = await _once()
+    if v is not None:
+        return v
+    return await _once()
+
+# ======================
+# 재고수량 (dialog 모드: 상세 열어 10000 입력→경고 파싱, 정확도↑)
+# ======================
+async def fetch_stock_from_detail(page, goods_url: str) -> int | None:
+    """
+    우선순위:
+    1) DOM의 input[data-stock] (최우선)
+    2) 수량칸에 10000 입력 → dialog/페이지 텍스트: "최대수량은 ####이하"
+    3) 이벤트 후 다시 data-stock 재확인
+    4) (옵션) 무반응+10000 유지면 0
+    """
+    tmp = await page.context.new_page()
+    try:
+        tmp.set_default_timeout(9000)
+        await tmp.goto(goods_url, wait_until="domcontentloaded", timeout=9000)
+
+        async def read_dom_stocks():
+            try:
+                vals = await tmp.evaluate("""
+                    () => Array.from(document.querySelectorAll('input[data-stock]'))
+                               .map(el => el.getAttribute('data-stock'))
+                """)
+                found = []
+                for v in vals or []:
+                    if v:
+                        n = re.sub(r"[^\d]", "", v)
+                        if n.isdigit():
+                            found.append(int(n))
+                return max(found) if found else None
+            except:
+                return None
+
+        # 1) 먼저 data-stock 바로 읽기
+        v0 = await read_dom_stocks()
+        if v0 is not None:
+            return v0
+
+        # 수량 input 후보
+        selectors = [
+            "input[name='goodsCnt[]']","input[name='goodsCnt']","input[name^='goodsCnt']",
+            "[id*='option_display'] input[type='text']",".goods_qty input[type='text']",
+            "input.text.goodsCnt_0","input.text","input[type='text']"
+        ]
+        qty = None
+        for sel in selectors:
+            try:
+                await tmp.wait_for_selector(sel, timeout=2500)
+                els = await tmp.query_selector_all(sel)
+                if not els: continue
+                ranked = []
+                for el in els:
+                    name = (await el.get_attribute("name")) or ""
+                    ds   = await el.get_attribute("data-stock")
+                    rank = (1 if "goodsCnt" in name else 0) + (1 if ds else 0)
+                    ranked.append((rank, el))
+                ranked.sort(key=lambda x: -x[0])
+                qty = ranked[0][1]
+                break
+            except PwTimeoutError:
+                continue
+        if not qty:
+            return None
+
+        # dialog 캡처
+        dialog_msg = {"text": None}
+        def _on_dialog(d):
+            dialog_msg["text"] = d.message
+            asyncio.create_task(d.dismiss())
+        tmp.on("dialog", _on_dialog)
+
+        # 10000 입력 + 이벤트 트리거
+        await qty.click()
+        await qty.fill("")
+        await qty.type("10000", delay=5)
+        await tmp.evaluate("""
+            (el) => {
+                el.dispatchEvent(new Event('input', {bubbles:true}));
+                el.dispatchEvent(new Event('change',{bubbles:true}));
+            }
+        """, qty)
+        await tmp.evaluate("el => el.blur()", qty)
+        try: await qty.press("Enter")
+        except: pass
+        await tmp.wait_for_timeout(1200)
+
+        # 2) dialog 우선
+        if dialog_msg["text"]:
+            m = re.search(r"최대수량은\s*([\d,]+)\s*이하", dialog_msg["text"])
+            if m: return int(m.group(1).replace(",", ""))
+
+        # 2-보조) 페이지 내 텍스트
+        for sel in ["text=최대수량은","div:has-text('최대수량은')",
+                    "[class*='alert']:has-text('최대수량은')",
+                    "#option_display_item_0 :has-text('최대수량은')"]:
+            try:
+                el = await tmp.wait_for_selector(sel, timeout=1200)
+                if el:
+                    t = await el.text_content() or ""
+                    m = re.search(r"최대수량은\s*([\d,]+)\s*이하", t)
+                    if m: return int(m.group(1).replace(",", ""))
+            except PwTimeoutError:
+                continue
+
+        # 3) 이벤트 후 다시 data-stock 재확인
+        v1 = await read_dom_stocks()
+        if v1 is not None:
+            return v1
+
+        # 4) 완전 무반응 & 값이 10000이면 (옵션) 0
+        try:
+            val = await qty.input_value()
+            if val and re.sub(r"[^\d]", "", val) == "10000":
+                return 0 if TREAT_SILENT_AS_ZERO else None
+        except:
+            pass
+        return None
+    finally:
+        await tmp.close()
+
+# ======================
+# 재고 병렬 보강 (모드 스위치 지원)
+# ======================
+async def enrich_stocks_concurrently(context, rows: list[dict]):
+    if not ENABLE_STOCK:
+        return rows
+
+    targets = [(i, r["URL"]) for i, r in enumerate(rows) if r.get("URL")]
+    if not targets:
+        return rows
+
+    # dialog 모드는 상세 탭을 열어야 해서 과도한 병렬은 비추천(4~6 정도 권장)
+    concurrency = STOCK_CONCURRENCY if STOCK_MODE == "http" else min(6, max(1, STOCK_CONCURRENCY))
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def worker_http(idx: int, url: str):
+        async with sem:
+            v = await fetch_stock_http(context.request, url)
+            return idx, v
+
+    async def worker_dialog(idx: int, url: str):
+        async with sem:
+            # context.pages[0]는 로그인된 메인 페이지. 상세 탭은 함수 내부에서 열고 닫음.
+            page0 = context.pages[0]
+            v = await fetch_stock_from_detail(page0, url)
+            return idx, v
+
+    tasks = [
+        asyncio.create_task(
+            worker_http(i, u) if STOCK_MODE == "http" else worker_dialog(i, u)
+        ) for i, u in targets
+    ]
+
+    for fut in asyncio.as_completed(tasks):
+        idx, stock = await fut
+        rows[idx]["재고수량"] = stock
+    return rows
+
+# ======================
+# Google Sheets
 # ======================
 def get_gspread_client():
     scopes = [
@@ -371,7 +511,6 @@ def get_gspread_client():
     ]
     json_str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     file_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
-
     if json_str:
         info = json.loads(json_str)
         creds = Credentials.from_service_account_info(info, scopes=scopes)
@@ -389,7 +528,6 @@ def upload_df_to_sheet(df: pd.DataFrame, sheet_id: str, tab_name: str):
     except gspread.exceptions.WorksheetNotFound:
         ws = sh.add_worksheet(title=tab_name, rows="100", cols="20")
 
-    # 저장 컬럼 순서 강제 (재고수량을 개당단가와 판매수량 사이)
     cols = ["카테고리","상품명","유통기한","묶음당수량","묶음단가","개당단가",
             "재고수량","판매수량","판매가","마진율","URL","이미지URL"]
     df = df.reindex(columns=cols)
@@ -402,32 +540,46 @@ def upload_df_to_sheet(df: pd.DataFrame, sheet_id: str, tab_name: str):
 # 메인
 # ======================
 async def main():
+    print("🚀 crawler start")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context()
+        ctx = await browser.new_context(
+            locale="ko-KR",
+            timezone_id="Asia/Seoul",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+        )
 
-        # 이미지/폰트/미디어만 차단 (stylesheet 허용: DOM 안정성/속도 균형)
+        # 리스트 페이지 빨리: 이미지/미디어/폰트 차단
         async def route_intercept(route):
             rt = route.request.resource_type
             if rt in {"image", "media", "font"}:
                 return await route.abort()
             return await route.continue_()
         await ctx.route("**/*", route_intercept)
-        ctx.set_default_timeout(5000)
+        ctx.set_default_timeout(6000)
 
         page = await ctx.new_page()
+        print("🔑 try login...")
         await login(page)
+        print("✅ login ok")
 
+        # 1) 목록 수집 (재고 제외)
         all_rows = []
         for name, code in CATE_CODES.items():
             items = await crawl_category(page, name, code)
             print(f"[완료] {name}({code}) -> {len(items)}개")
             all_rows += items
 
+        # 2) 재고 보강
+        if ENABLE_STOCK:
+            mode = "HTTP" if STOCK_MODE == "http" else "DIALOG"
+            print(f"🔎 재고 수집 시작 (모드 {mode}, 동시 {STOCK_CONCURRENCY})...")
+            all_rows = await enrich_stocks_concurrently(ctx, all_rows)
+
         df = pd.DataFrame(all_rows).drop_duplicates().reset_index(drop=True)
         print(f"총 행수: {len(df)}")
 
-        # 로컬 CSV 백업(선택)
+        # 로컬 백업
         df.to_csv("3bong_products.csv", index=False, encoding="utf-8-sig")
 
         # 시트 업로드
