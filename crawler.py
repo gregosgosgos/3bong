@@ -18,6 +18,10 @@ USER_PW   = os.getenv("USER_PW")
 SHEET_ID  = os.getenv("SHEET_ID")
 SHEET_TAB = os.getenv("SHEET_TAB", "크롤링결과")
 
+# 탐색 타임아웃/재시도 (GitHub Actions 안정화)
+NAV_TIMEOUT_MS = int(os.getenv("NAV_TIMEOUT_MS", "20000"))  # 기본 20초
+NAV_RETRIES    = int(os.getenv("NAV_RETRIES", "3"))         # (옵션) 재시도 횟수
+
 # 성능/재고 관련 옵션(.env)
 ENABLE_STOCK = os.getenv("ENABLE_STOCK", "1") == "1"       # 0이면 재고 수집 스킵
 STOCK_MODE = os.getenv("STOCK_MODE", "http")               # "http" (빠름) 또는 "dialog" (정확도↑)
@@ -148,7 +152,27 @@ async def login(page):
         btn = await page.query_selector(s)
         if btn: await btn.click(); clicked = True; break
     if not clicked: await page.keyboard.press("Enter")
-    await page.wait_for_load_state("networkidle")
+
+    # 제출 직후 로딩/리다이렉트 넉넉히 대기
+    try:
+        # 네비게이션이 발생하면 잡고(리다이렉트 등), 발생하지 않아도 아래로 진행
+        async with page.expect_navigation(timeout=NAV_TIMEOUT_MS):
+            pass
+    except:
+        pass
+
+    # 네트워크 유휴까지 대기(안 되면 domcontentloaded로 완화)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT_MS)
+    except:
+        await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
+
+    # (선택) 혹시 여전히 로그인 URL이면 홈으로 한 번 더 진입
+    if "login.php" in page.url:
+        try:
+            await page.goto(f"{SITE_BASE}/", wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        except:
+            pass
 
 # ======================
 # 페이지 수 추정
@@ -265,7 +289,7 @@ async def parse_card_to_row_base(page, card, cate_name: str, current_url: str):
     if link:
         href = await link.get_attribute("href")
         if href:
-            full = urljoin(current_url, href)   # ✅ 핵심: goods/goods/goods_view.php 방지
+            full = urljoin(current_url, href)   # ✅ goods/goods/goods_view.php 방지
             qs = parse_qs(urlparse(full).query)
             code = qs.get("goodsNo", [None])[0]
     if not code:
@@ -305,7 +329,7 @@ async def parse_card_to_row_base(page, card, cate_name: str, current_url: str):
 async def crawl_category(page, cate_name: str, cate_code: str):
     rows = []
     first = build_list_url(cate_code, 1)
-    await page.goto(first, wait_until="domcontentloaded")
+    await page.goto(first, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     max_page = await get_max_page_on(page)
     if max_page < 1: max_page = 1
     if MAX_PAGES and max_page > MAX_PAGES:
@@ -314,7 +338,7 @@ async def crawl_category(page, cate_name: str, cate_code: str):
 
     for p in range(1, max_page + 1):
         url = build_list_url(cate_code, p)
-        await page.goto(url, wait_until="domcontentloaded")
+        await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
         cards = await page.query_selector_all(CARD_SEL)
         print(f"[{cate_name}] {p}페이지 카드수: {len(cards)}")
         if not cards:
@@ -542,12 +566,19 @@ def upload_df_to_sheet(df: pd.DataFrame, sheet_id: str, tab_name: str):
 async def main():
     print("🚀 crawler start")
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]  # CI 안정화
+        )
         ctx = await browser.new_context(
             locale="ko-KR",
             timezone_id="Asia/Seoul",
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
         )
+
+        # 기본/네비게이션 타임아웃을 넉넉히
+        ctx.set_default_timeout(NAV_TIMEOUT_MS)
+        ctx.set_default_navigation_timeout(NAV_TIMEOUT_MS)
 
         # 리스트 페이지 빨리: 이미지/미디어/폰트 차단
         async def route_intercept(route):
@@ -556,9 +587,11 @@ async def main():
                 return await route.abort()
             return await route.continue_()
         await ctx.route("**/*", route_intercept)
-        ctx.set_default_timeout(6000)
 
         page = await ctx.new_page()
+        page.set_default_timeout(NAV_TIMEOUT_MS)
+        page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+
         print("🔑 try login...")
         await login(page)
         print("✅ login ok")
