@@ -239,29 +239,83 @@ FEE_RATE = 0.22
 BAND_MIN = 0.10
 BAND_MAX = 0.20
 
+# ▼ 새로 추가할 fallback 기준
+FALLBACK_MIN_MARGIN = 0.05      # 실패시 최소 허용 마진 5%
+FALLBACK_START_PRICE = 4900     # 900원 끝나는 시작 가격
+FALLBACK_MAX_PRICE = 19900      # 상한 (원하면 29900 등으로 조정 가능)
+FALLBACK_STEP = 1000            # 4900, 5900, 6900 ...
+
 def choose_sale_combo(unit_cost: float | None):
+    """
+    1) 우선 1900/2900/3900에서 마진 10~20% 밴드 내 최적 조합 선택
+       - 없으면 10~20% 초과 중 초과폭 최소 선택
+    2) 그래도 실패면 900원 끝나는 상위 가격대(4900, 5900, ...) 중에서
+       마진 ≥ 5% 되는 '최저 가격대'를 선택
+       - 가능하면 10~20% 밴드 안에 드는 후보를 우선 (동률이면 더 낮은 가격)
+       - 전혀 없으면 ≥5% 중 '최저 가격대' 선택
+    반환: (판매가, 판매수량, 마진율) 또는 (None, None, None)
+    """
     if unit_cost is None or unit_cost <= 0:
         return None, None, None
+
+    # ---------- 1) 기본 후보: 1900/2900/3900 ----------
     feasible = []
     for sp in SALE_CANDIDATES:
         net = sp * (1 - FEE_RATE)
-        if net <= 0: continue
+        if net <= 0:
+            continue
+        # 밴드 하한(10%) 보장용: 최대 판매수량
         q_max = int((1 - BAND_MIN) * net // unit_cost)  # floor(0.9*net/unit_cost)
         if q_max >= 1:
             margin = 1 - (q_max * unit_cost) / net
             feasible.append((sp, q_max, margin))
-    if not feasible:
-        return None, None, None
-    in_band = [r for r in feasible if BAND_MIN <= r[2] <= BAND_MAX]
-    if in_band:
-        in_band.sort(key=lambda x: (-x[2], x[0]))    # 마진 내림차순, 동률이면 낮은 판매가
-        return in_band[0]
-    above = [r for r in feasible if r[2] > BAND_MAX]
-    if above:
-        above.sort(key=lambda x: (x[2] - BAND_MAX, x[0]))  # 초과폭 최소, 동률이면 낮은 판매가
-        return above[0]
-    return None, None, None
 
+    if feasible:
+        in_band = [r for r in feasible if BAND_MIN <= r[2] <= BAND_MAX]
+        if in_band:
+            in_band.sort(key=lambda x: (-x[2], x[0]))    # 마진 높은 순, 동률시 낮은 판매가
+            return in_band[0]
+        above = [r for r in feasible if r[2] > BAND_MAX]
+        if above:
+            above.sort(key=lambda x: (x[2] - BAND_MAX, x[0]))  # 초과폭 최소, 동률시 낮은 판매가
+            return above[0]
+        # (feasible가 있는데 in_band/above가 비었다 = 전부 10% 미만)
+        # → fallback으로 진행
+
+    # ---------- 2) Fallback: 900원 끝나는 상위 가격대에서 ≥5% ----------
+    fb_candidates = []
+    fb_candidates_in_band = []  # 10~20%에 들어온 fallback 후보
+
+    for sp in range(FALLBACK_START_PRICE, FALLBACK_MAX_PRICE + 1, FALLBACK_STEP):
+        # 900원 끝나는 가격만 필터 (안전장치)
+        if sp % 1000 != 900:
+            continue
+        net = sp * (1 - FEE_RATE)
+        if net <= 0:
+            continue
+        # 5% 하한 보장: 최대 판매수량
+        q_max = int((1 - FALLBACK_MIN_MARGIN) * net // unit_cost)  # floor(0.95*net/unit_cost)
+        if q_max < 1:
+            continue
+        margin = 1 - (q_max * unit_cost) / net
+        if margin >= FALLBACK_MIN_MARGIN:
+            rec = (sp, q_max, margin)
+            fb_candidates.append(rec)
+            if BAND_MIN <= margin <= BAND_MAX:
+                fb_candidates_in_band.append(rec)
+
+    # 우선 10~20% 밴드 안에서 '최저 가격대' 선택
+    if fb_candidates_in_band:
+        fb_candidates_in_band.sort(key=lambda x: (x[0], -x[2]))  # 낮은 가격 우선, 동률이면 마진 큰 것
+        return fb_candidates_in_band[0]
+
+    # 그 다음엔 ≥5% 전체 중 '최저 가격대' 선택
+    if fb_candidates:
+        fb_candidates.sort(key=lambda x: (x[0], -x[2]))  # 낮은 가격 우선
+        return fb_candidates[0]
+
+    # 그래도 없으면 실패
+    return None, None, None
 # ======================
 # 카드 → 기초 행 (재고 제외)
 # ======================
